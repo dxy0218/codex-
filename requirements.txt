@@ -1,0 +1,2 @@
+yfinance>=0.2.54
+openai>=1.40.0
