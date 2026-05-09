@@ -3,7 +3,8 @@
 这是一个可在 Windows 运行的 Python 桌面程序：
 - 实时拉取真实市场行情（默认美股、A股/港股、日股、欧股示例）
 - 模拟买入/卖出与持仓管理（练习盘）
-- 可接入 OpenAI 做投资训练复盘建议
+- 通过 **OpenAI 会员订阅模式** 接入 AI 训练（不走 API 按量计费）
+- 内置投资限制（单笔上限 + 总投资上限），避免练习结果偏离现实
 
 ## 1. 环境准备
 
@@ -20,21 +21,26 @@ pip install -r requirements.txt
 python app.py
 ```
 
-## 3. AI 训练功能（可选）
+## 3. 会员订阅模式 AI 训练
 
-设置环境变量后，点击按钮“AI训练建议”：
+点击按钮“会员AI训练”后：
+1. 程序自动生成训练提示词
+2. 自动打开 ChatGPT 网页（`chatgpt.com`）
+3. 使用你的会员账号继续训练
 
-```bash
-set OPENAI_API_KEY=你的key
-```
+> 该方式不调用 API，不需要 `OPENAI_API_KEY`，可减少实际 token 消耗。
 
-> PowerShell:
+## 4. 风险与现实约束
 
-```powershell
-$env:OPENAI_API_KEY="你的key"
-```
+程序默认限制：
+- 单笔交易上限：`200,000`
+- 总投资上限：`1,000,000`
 
-## 4. 打包为 Windows 可执行文件（可选）
+你可以在 `app.py` 中修改：
+- `MAX_SINGLE_TRADE`
+- `MAX_TOTAL_EXPOSURE`
+
+## 5. 打包为 Windows 可执行文件（可选）
 
 ```bash
 pip install pyinstaller
@@ -43,7 +49,7 @@ pyinstaller --noconfirm --onefile --windowed app.py
 
 生成的 exe 在 `dist/app.exe`。
 
-## 5. 说明
+## 6. 说明
 
 - 数据源使用 `yfinance`，不同市场代码格式不同（例如 `7203.T`、`0700.HK`）。
 - 默认每 5 秒尝试刷新一次当前关注标的价格。

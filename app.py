@@ -11,12 +11,12 @@ from tkinter import ttk, messagebox
 
 import yfinance as yf
 
-try:
-    from openai import OpenAI
-except Exception:
-    OpenAI = None
+import webbrowser
+import urllib.parse
 
 DATA_FILE = Path("portfolio.json")
+MAX_TOTAL_EXPOSURE = 1_000_000.0  # 总投资上限，避免与真实资金规模偏离过大
+MAX_SINGLE_TRADE = 200_000.0      # 单笔交易上限
 
 MARKETS = {
     "US": ["AAPL", "MSFT", "NVDA", "SPY"],
@@ -38,10 +38,17 @@ class Portfolio:
         self.cash = cash
         self.positions: Dict[str, Position] = {}
 
+    def exposure(self) -> float:
+        return sum(p.shares * p.avg_price for p in self.positions.values())
+
     def buy(self, symbol: str, shares: float, price: float):
         cost = shares * price
         if cost > self.cash:
             raise ValueError("现金不足")
+        if cost > MAX_SINGLE_TRADE:
+            raise ValueError(f"单笔交易上限为 {MAX_SINGLE_TRADE:.0f}")
+        if self.exposure() + cost > MAX_TOTAL_EXPOSURE:
+            raise ValueError(f"总投资上限为 {MAX_TOTAL_EXPOSURE:.0f}")
         pos = self.positions.get(symbol)
         if pos:
             total_cost = pos.shares * pos.avg_price + cost
@@ -88,7 +95,7 @@ class App(tk.Tk):
         self.symbol = tk.StringVar(value=MARKETS["US"][0])
         self.price_var = tk.StringVar(value="--")
         self.cash_var = tk.StringVar()
-        self.ai_text = tk.StringVar(value="AI 建议会显示在这里")
+        self.ai_text = tk.StringVar(value="AI 训练建议会显示在这里（会员订阅模式）")
 
         self.portfolio = Portfolio.from_file(DATA_FILE)
         self.price_cache: Dict[str, float] = {}
@@ -129,7 +136,7 @@ class App(tk.Tk):
         ttk.Button(trade, text="买入", command=self._buy).grid(row=0, column=2, padx=8)
         ttk.Button(trade, text="卖出", command=self._sell).grid(row=0, column=3, padx=8)
         ttk.Button(trade, text="保存组合", command=self._save).grid(row=0, column=4, padx=8)
-        ttk.Button(trade, text="AI训练建议", command=self._ask_ai).grid(row=0, column=5, padx=8)
+        ttk.Button(trade, text="会员AI训练", command=self._ask_ai_subscription).grid(row=0, column=5, padx=8)
 
         middle = ttk.PanedWindow(self, orient="horizontal")
         middle.pack(fill="both", expand=True, padx=12, pady=8)
@@ -189,15 +196,21 @@ class App(tk.Tk):
         symbol = self.symbol.get().strip().upper()
         shares = float(self.shares_entry.get())
         price = self._current_price(symbol)
-        self.portfolio.buy(symbol, shares, price)
-        self._refresh_portfolio_view()
+        try:
+            self.portfolio.buy(symbol, shares, price)
+            self._refresh_portfolio_view()
+        except Exception as e:
+            messagebox.showwarning("交易限制", str(e))
 
     def _sell(self):
         symbol = self.symbol.get().strip().upper()
         shares = float(self.shares_entry.get())
         price = self._current_price(symbol)
-        self.portfolio.sell(symbol, shares, price)
-        self._refresh_portfolio_view()
+        try:
+            self.portfolio.sell(symbol, shares, price)
+            self._refresh_portfolio_view()
+        except Exception as e:
+            messagebox.showwarning("交易限制", str(e))
 
     def _save(self):
         DATA_FILE.write_text(json.dumps(self.portfolio.to_json(), ensure_ascii=False, indent=2), encoding="utf-8")
@@ -210,33 +223,24 @@ class App(tk.Tk):
         for pos in self.portfolio.positions.values():
             self.holding_view.insert("", "end", values=(pos.symbol, f"{pos.shares:.2f}", f"{pos.avg_price:.2f}"))
 
-    def _ask_ai(self):
-        if OpenAI is None:
-            self.ai_text.set("未安装 openai 包，无法启用 AI 建议。")
-            return
-        api_key = __import__("os").environ.get("OPENAI_API_KEY")
-        if not api_key:
-            self.ai_text.set("请先设置 OPENAI_API_KEY 环境变量。")
-            return
-
+    def _ask_ai_subscription(self):
+        """会员订阅模式：不走 API，不产生按量 token 费用。"""
         snapshot = self.portfolio.to_json()
         symbol = self.symbol.get().strip().upper()
         price = self.price_cache.get(symbol, None)
 
-        try:
-            client = OpenAI(api_key=api_key)
-            prompt = (
-                "你是投资教练。请基于以下虚拟账户快照，给出风险提示、仓位建议、复盘训练任务。"
-                f"账户: {json.dumps(snapshot, ensure_ascii=False)}; 当前关注股票: {symbol}; 价格: {price}"
-            )
-            resp = client.responses.create(
-                model="gpt-4.1-mini",
-                input=prompt,
-                temperature=0.3,
-            )
-            self.ai_text.set(resp.output_text[:800])
-        except Exception as e:
-            self.ai_text.set(f"AI 请求失败: {e}")
+        training_prompt = (
+            "你是投资教练。请基于我的虚拟账户快照，输出："
+            "1) 风险提示 2) 仓位建议 3) 今日复盘任务。"
+            f"账户={json.dumps(snapshot, ensure_ascii=False)}；关注股票={symbol}；当前价={price}"
+        )
+
+        self.ai_text.set(
+            "已生成训练提示词（会员订阅模式）。\n将自动打开 ChatGPT 网页，请粘贴提示词进行训练，不调用 API。"
+        )
+
+        encoded = urllib.parse.quote(training_prompt)
+        webbrowser.open(f"https://chatgpt.com/?q={encoded}")
 
 
 if __name__ == "__main__":
