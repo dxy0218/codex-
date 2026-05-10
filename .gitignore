@@ -1,0 +1,26 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.venv/
+venv/
+
+# App data
+users.json
+*.sqlite3
+*.db
+*.corrupt-*.json
+*.migrated-*.json
+
+# PyInstaller
+build/
+dist/
+*.manifest
+*.log
+
+# OS / editors
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
