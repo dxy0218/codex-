@@ -429,6 +429,8 @@ class App(tk.Tk):
         self.backtest_period_var = tk.StringVar(value="1y")
         self.backtest_fast_var = tk.IntVar(value=20)
         self.backtest_slow_var = tk.IntVar(value=60)
+        self.dashboard_symbol_var = tk.StringVar(value="000001.SS")
+        self.dashboard_period_var = tk.StringVar(value="6mo")
 
         self.portfolio = Portfolio()
         self.price_cache: Dict[str, float] = {}
@@ -629,31 +631,103 @@ class App(tk.Tk):
         self.status_var.set("策略参数已保存")
 
     def _build_home_tab(self):
-        wrap = ttk.Frame(self.home_tab, padding=18)
+        wrap = ttk.Frame(self.home_tab, padding=10)
         wrap.pack(fill="both", expand=True)
-        ttk.Label(wrap, text="虚拟股市训练器", font=("Microsoft YaHei UI", 20, "bold")).pack(anchor="w")
-        ttk.Label(wrap, text="练习交易、观察自选股、查看收益曲线，并用均线策略做快速回测。", foreground="#555").pack(anchor="w", pady=(4, 16))
-        cards = ttk.Frame(wrap)
-        cards.pack(fill="x")
+        top = ttk.Frame(wrap)
+        top.pack(fill="x", pady=(0, 8))
+        ttk.Label(top, text="全球市场看板", font=("Microsoft YaHei UI", 18, "bold")).pack(side="left")
+        ttk.Label(top, text="  大盘/期货K线 · 实时行情 · 金融资讯", foreground=MUTED_FG).pack(side="left")
+
+        body = ttk.PanedWindow(wrap, orient="horizontal")
+        body.pack(fill="both", expand=True)
+        left = ttk.Frame(body)
+        right = ttk.Frame(body)
+        body.add(left, weight=4)
+        body.add(right, weight=2)
+
+        controls = ttk.Frame(left, style="Card.TFrame")
+        controls.pack(fill="x", pady=(0, 8))
+        universe = {**MARKET_INDICES, **{v["name"]: k for k, v in FUTURES_CONTRACTS.items()}}
+        self.dashboard_symbol_map = universe
+        ttk.Label(controls, text="市场/合约", background=CARD_BG, foreground=MUTED_FG).pack(side="left", padx=(10, 4), pady=8)
+        self.dashboard_box = ttk.Combobox(controls, textvariable=self.dashboard_symbol_var, values=list(universe.values()), width=16)
+        self.dashboard_box.pack(side="left", padx=4)
+        ttk.Label(controls, text="周期", background=CARD_BG, foreground=MUTED_FG).pack(side="left", padx=(12, 4))
+        ttk.Combobox(controls, textvariable=self.dashboard_period_var, values=["1mo", "3mo", "6mo", "1y", "2y"], width=8, state="readonly").pack(side="left", padx=4)
+        ttk.Button(controls, text="刷新K线", command=self._refresh_dashboard_chart).pack(side="left", padx=8)
+        ttk.Button(controls, text="刷新新闻", command=self._refresh_market_news).pack(side="left", padx=4)
+
+        self.home_chart_canvas = tk.Canvas(left, bg="#08111d", height=460, highlightthickness=0)
+        self.home_chart_canvas.pack(fill="both", expand=True)
         self.home_summary_var = tk.StringVar()
-        ttk.Label(cards, textvariable=self.home_summary_var, justify="left", font=("Microsoft YaHei UI", 11)).pack(side="left", anchor="n", padx=(0, 40))
-        actions = ttk.LabelFrame(cards, text="快捷入口", padding=10)
-        actions.pack(side="left", fill="x", expand=True)
-        ttk.Button(actions, text="去交易", command=lambda: self.tabs.select(self.trade_tab)).grid(row=0, column=0, padx=6, pady=6, sticky="we")
-        ttk.Button(actions, text="管理自选股", command=lambda: self.tabs.select(self.watch_tab)).grid(row=0, column=1, padx=6, pady=6, sticky="we")
-        ttk.Button(actions, text="查看收益曲线", command=lambda: self.tabs.select(self.chart_tab)).grid(row=1, column=0, padx=6, pady=6, sticky="we")
-        ttk.Button(actions, text="运行回测", command=lambda: self.tabs.select(self.backtest_tab)).grid(row=1, column=1, padx=6, pady=6, sticky="we")
-        for i in range(2):
-            actions.columnconfigure(i, weight=1)
-        ttk.Separator(wrap).pack(fill="x", pady=18)
-        ttk.Label(wrap, text="产品化更新", font=("Microsoft YaHei UI", 12, "bold")).pack(anchor="w")
-        notes = (
-            "• 数据已迁移到 SQLite，更适合长期使用和后续扩展。\n"
-            "• 回测参数会自动保存，下次登录继续使用。\n"
-            "• 支持K线图、回测报告导出和 Windows exe 打包。\n"
-            "• 本软件仅用于交易训练，不构成投资建议。"
-        )
-        ttk.Label(wrap, text=notes, justify="left").pack(anchor="w", pady=8)
+        ttk.Label(left, textvariable=self.home_summary_var, justify="left", foreground=MUTED_FG).pack(anchor="w", pady=(8, 0))
+
+        ttk.Label(right, text="金融资讯", font=("Microsoft YaHei UI", 13, "bold")).pack(anchor="w")
+        self.news_list = tk.Listbox(right, height=24, bg="#101923", fg=TEXT_FG, selectbackground="#315a86", relief="flat")
+        self.news_list.pack(fill="both", expand=True, pady=(6, 8))
+        self.news_list.bind("<Double-1>", lambda _event: self._open_selected_news())
+        self.news_links: List[str] = []
+        ttk.Label(right, text="双击新闻可打开原文；新闻来自 yfinance，可用性取决于数据源。", foreground=MUTED_FG, wraplength=320).pack(anchor="w")
+        self.after(800, self._refresh_dashboard_chart)
+        self.after(1200, self._refresh_market_news)
+
+    def _refresh_dashboard_chart(self):
+        symbol = self.dashboard_symbol_var.get().strip().upper() or "000001.SS"
+        self.status_var.set(f"正在刷新 {symbol} K线...")
+        threading.Thread(target=self._dashboard_chart_worker, args=(symbol, self.dashboard_period_var.get()), daemon=True).start()
+
+    def _dashboard_chart_worker(self, symbol: str, period: str):
+        try:
+            hist = yf.Ticker(symbol).history(period=period or "6mo", interval="1d")
+            if hist.empty:
+                raise ValueError("未获取到历史K线")
+            rows = [(float(r["Open"]), float(r["High"]), float(r["Low"]), float(r["Close"])) for _, r in hist.tail(120).iterrows()]
+            self.after(0, lambda: self._draw_candles(self.home_chart_canvas, rows, f"{symbol} {period} 日K线"))
+            self.after(0, lambda: self.status_var.set(f"{symbol} K线已更新"))
+        except Exception as exc:
+            self.after(0, lambda: self.status_var.set(f"K线刷新失败: {exc}"))
+
+    def _refresh_market_news(self):
+        symbols = [self.dashboard_symbol_var.get().strip().upper() or "000001.SS", "^GSPC", "^IXIC", "ES=F", "GC=F"]
+        self.status_var.set("正在刷新金融资讯...")
+        threading.Thread(target=self._market_news_worker, args=(symbols,), daemon=True).start()
+
+    def _market_news_worker(self, symbols: List[str]):
+        items = []
+        seen = set()
+        for sym in symbols:
+            try:
+                for item in (yf.Ticker(sym).news or [])[:5]:
+                    title = item.get("title") or item.get("content", {}).get("title")
+                    link = item.get("link") or item.get("content", {}).get("canonicalUrl", {}).get("url")
+                    if title and title not in seen:
+                        seen.add(title)
+                        items.append((sym, title, link or ""))
+            except Exception:
+                continue
+        if not items:
+            items = [("INFO", "暂未获取到新闻，请稍后刷新", "")]
+        self.after(0, lambda: self._show_market_news(items[:20]))
+
+    def _show_market_news(self, items: List[Tuple[str, str, str]]):
+        if not hasattr(self, "news_list"):
+            return
+        self.news_list.delete(0, "end")
+        self.news_links = []
+        for sym, title, link in items:
+            self.news_list.insert("end", f"[{sym}] {title}")
+            self.news_links.append(link)
+        self.status_var.set("金融资讯已更新")
+
+    def _open_selected_news(self):
+        if not hasattr(self, "news_list"):
+            return
+        sel = self.news_list.curselection()
+        if not sel:
+            return
+        link = self.news_links[sel[0]] if sel[0] < len(self.news_links) else ""
+        if link:
+            webbrowser.open(link)
 
     def _refresh_home_summary(self):
         if not hasattr(self, "home_summary_var"):
