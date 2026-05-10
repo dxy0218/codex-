@@ -57,12 +57,38 @@ UP_COLOR = "#e84b4b"
 DOWN_COLOR = "#21a67a"
 ACCENT = "#2f80ed"
 
+FUTURES_CONTRACTS = {
+    "ES=F": {"name": "标普500 E-mini", "exchange": "CME", "multiplier": 50, "margin_rate": 0.12, "currency": "USD"},
+    "NQ=F": {"name": "纳斯达克100 E-mini", "exchange": "CME", "multiplier": 20, "margin_rate": 0.14, "currency": "USD"},
+    "YM=F": {"name": "道指 E-mini", "exchange": "CBOT", "multiplier": 5, "margin_rate": 0.10, "currency": "USD"},
+    "GC=F": {"name": "COMEX黄金", "exchange": "COMEX", "multiplier": 100, "margin_rate": 0.10, "currency": "USD"},
+    "CL=F": {"name": "NYMEX原油", "exchange": "NYMEX", "multiplier": 1000, "margin_rate": 0.12, "currency": "USD"},
+}
+
+
+def market_rule_for(symbol: str) -> dict:
+    symbol = symbol.upper()
+    if symbol in FUTURES_CONTRACTS:
+        return {"asset_type": "期货", "market": FUTURES_CONTRACTS[symbol]["exchange"], "lot_size": 1, "short_allowed": True, "t_plus_one": False}
+    if symbol.endswith((".SS", ".SZ")):
+        return {"asset_type": "股票", "market": "A股", "lot_size": 100, "short_allowed": False, "t_plus_one": True}
+    if symbol.endswith(".HK"):
+        return {"asset_type": "股票", "market": "港股", "lot_size": 100, "short_allowed": False, "t_plus_one": False}
+    if symbol.endswith(".T"):
+        return {"asset_type": "股票", "market": "日股", "lot_size": 100, "short_allowed": False, "t_plus_one": False}
+    if "." in symbol and not symbol.startswith("^"):
+        return {"asset_type": "股票", "market": "国际", "lot_size": 1, "short_allowed": False, "t_plus_one": False}
+    return {"asset_type": "股票", "market": "美股", "lot_size": 1, "short_allowed": False, "t_plus_one": False}
+
 
 @dataclass
 class Position:
     symbol: str
     shares: float
     avg_price: float
+    asset_type: str = "股票"
+    market: str = "美股"
+    opened_at: str = ""
 
 
 class Portfolio:
@@ -71,12 +97,22 @@ class Portfolio:
         self.positions: Dict[str, Position] = {}
 
     def exposure(self) -> float:
-        return sum(p.shares * p.avg_price for p in self.positions.values())
+        total = 0.0
+        for p in self.positions.values():
+            if p.asset_type == "期货" and p.symbol in FUTURES_CONTRACTS:
+                total += abs(p.shares) * p.avg_price * FUTURES_CONTRACTS[p.symbol]["multiplier"]
+            else:
+                total += abs(p.shares) * p.avg_price
+        return total
 
     def market_value(self, price_cache: Dict[str, float]) -> float:
         total = self.cash
         for pos in self.positions.values():
-            total += pos.shares * price_cache.get(pos.symbol, pos.avg_price)
+            latest = price_cache.get(pos.symbol, pos.avg_price)
+            if pos.asset_type == "期货" and pos.symbol in FUTURES_CONTRACTS:
+                total += (latest - pos.avg_price) * pos.shares * FUTURES_CONTRACTS[pos.symbol]["multiplier"]
+            else:
+                total += pos.shares * latest
         return total
 
     @staticmethod
@@ -84,9 +120,24 @@ class Portfolio:
         if not math.isfinite(value) or value <= 0:
             raise ValueError(f"{name}必须是大于 0 的有效数字")
 
+    @staticmethod
+    def _validate_lot(symbol: str, shares: float, action: str):
+        rule = market_rule_for(symbol)
+        lot = rule["lot_size"]
+        if rule["asset_type"] == "股票" and action == "buy" and lot > 1 and not math.isclose(shares % lot, 0, abs_tol=1e-9):
+            raise ValueError(f"{rule['market']}买入需按 {lot} 股/手整数倍下单")
+        if rule["asset_type"] == "期货" and not float(shares).is_integer():
+            raise ValueError("期货按合约整数手交易")
+
     def buy(self, symbol: str, shares: float, price: float):
+        symbol = symbol.upper()
         self._validate_positive_number("数量", shares)
         self._validate_positive_number("价格", price)
+        self._validate_lot(symbol, shares, "buy")
+        rule = market_rule_for(symbol)
+        if rule["asset_type"] == "期货":
+            self.open_future(symbol, shares, price, side="long")
+            return
         cost = shares * price
         if cost > self.cash:
             raise ValueError("现金不足")
@@ -101,17 +152,63 @@ class Portfolio:
             pos.avg_price = total_cost / total_shares
             pos.shares = total_shares
         else:
-            self.positions[symbol] = Position(symbol, shares, price)
+            self.positions[symbol] = Position(symbol, shares, price, rule["asset_type"], rule["market"], datetime.now().date().isoformat())
         self.cash -= cost
 
     def sell(self, symbol: str, shares: float, price: float):
+        symbol = symbol.upper()
         self._validate_positive_number("数量", shares)
         self._validate_positive_number("价格", price)
+        self._validate_lot(symbol, shares, "sell")
+        rule = market_rule_for(symbol)
         pos = self.positions.get(symbol)
+        if rule["asset_type"] == "期货":
+            if pos and pos.shares > 0:
+                self.close_future(symbol, shares, price)
+            else:
+                self.open_future(symbol, shares, price, side="short")
+            return
         if not pos or pos.shares < shares:
-            raise ValueError("持仓不足")
+            raise ValueError("持仓不足；股票模拟暂不允许裸卖空")
+        if rule.get("t_plus_one") and pos.opened_at == datetime.now().date().isoformat():
+            raise ValueError("A股执行 T+1：当日买入的股票不能当日卖出")
         pos.shares -= shares
         self.cash += shares * price
+        if math.isclose(pos.shares, 0, abs_tol=1e-9):
+            del self.positions[symbol]
+
+    def open_future(self, symbol: str, contracts: float, price: float, side: str):
+        spec = FUTURES_CONTRACTS.get(symbol)
+        if not spec:
+            raise ValueError("未配置该期货合约参数")
+        signed = contracts if side == "long" else -contracts
+        margin = abs(contracts) * price * spec["multiplier"] * spec["margin_rate"]
+        if margin > self.cash:
+            raise ValueError(f"保证金不足，需要约 {margin:.2f}")
+        pos = self.positions.get(symbol)
+        if pos and pos.shares * signed < 0:
+            raise ValueError("已有反向期货持仓，请先平仓")
+        if pos:
+            total_contracts = abs(pos.shares) + contracts
+            pos.avg_price = (abs(pos.shares) * pos.avg_price + contracts * price) / total_contracts
+            pos.shares += signed
+        else:
+            rule = market_rule_for(symbol)
+            self.positions[symbol] = Position(symbol, signed, price, "期货", rule["market"], datetime.now().date().isoformat())
+        self.cash -= margin
+
+    def close_future(self, symbol: str, contracts: float, price: float):
+        pos = self.positions.get(symbol)
+        spec = FUTURES_CONTRACTS.get(symbol)
+        if not pos or pos.asset_type != "期货":
+            raise ValueError("没有可平期货持仓")
+        if contracts > abs(pos.shares):
+            raise ValueError("平仓手数超过持仓")
+        direction = 1 if pos.shares > 0 else -1
+        pnl = (price - pos.avg_price) * contracts * spec["multiplier"] * direction
+        released_margin = contracts * pos.avg_price * spec["multiplier"] * spec["margin_rate"]
+        self.cash += released_margin + pnl
+        pos.shares -= contracts * direction
         if math.isclose(pos.shares, 0, abs_tol=1e-9):
             del self.positions[symbol]
 
@@ -122,13 +219,17 @@ class Portfolio:
     def from_json(raw):
         pf = Portfolio(cash=float(raw.get("cash", INITIAL_CASH)))
         for item in raw.get("positions", []):
-            pf.positions[item["symbol"]] = Position(
-                symbol=str(item["symbol"]).upper(),
+            symbol = str(item["symbol"]).upper()
+            rule = market_rule_for(symbol)
+            pf.positions[symbol] = Position(
+                symbol=symbol,
                 shares=float(item["shares"]),
                 avg_price=float(item["avg_price"]),
+                asset_type=str(item.get("asset_type", rule["asset_type"])),
+                market=str(item.get("market", rule["market"])),
+                opened_at=str(item.get("opened_at", "")),
             )
         return pf
-
 
 class UserStore:
     """SQLite-backed user store with JSON-file migration compatibility."""
@@ -316,6 +417,7 @@ class App(tk.Tk):
         self.user_data = None
 
         self.market = tk.StringVar(value="US")
+        self.asset_class = tk.StringVar(value="股票")
         self.symbol = tk.StringVar(value=MARKETS["US"][0])
         self.search_var = tk.StringVar()
         self.price_var = tk.StringVar(value="--")
@@ -407,22 +509,26 @@ class App(tk.Tk):
 
         trade = ttk.Frame(self.content, style="Card.TFrame")
         trade.pack(fill="x", pady=(0, 8))
-        ttk.Label(trade, text="市场", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=0, padx=(12, 4), pady=10)
+        ttk.Label(trade, text="品种", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=0, padx=(12, 4), pady=10)
+        asset_box = ttk.Combobox(trade, textvariable=self.asset_class, values=["股票", "期货"], width=7, state="readonly")
+        asset_box.grid(row=0, column=1, padx=4)
+        asset_box.bind("<<ComboboxSelected>>", self._on_asset_class_change)
+        ttk.Label(trade, text="市场", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=2, padx=(12, 4), pady=10)
         market_box = ttk.Combobox(trade, textvariable=self.market, values=list(MARKETS.keys()), width=8, state="readonly")
-        market_box.grid(row=0, column=1, padx=4)
+        market_box.grid(row=0, column=3, padx=4)
         market_box.bind("<<ComboboxSelected>>", self._on_market_change)
-        ttk.Label(trade, text="代码", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=2, padx=(12, 4))
+        ttk.Label(trade, text="代码", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=4, padx=(12, 4))
         self.symbol_box = ttk.Combobox(trade, textvariable=self.symbol, values=MARKETS[self.market.get()], width=14)
-        self.symbol_box.grid(row=0, column=3, padx=4)
+        self.symbol_box.grid(row=0, column=5, padx=4)
         self.symbol_box.bind("<<ComboboxSelected>>", lambda _event: self._request_price_refresh(force=True))
-        ttk.Button(trade, text="刷新", command=lambda: self._request_price_refresh(force=True)).grid(row=0, column=4, padx=4)
-        ttk.Button(trade, text="加入自选", command=self._add_current_to_watchlist).grid(row=0, column=5, padx=4)
-        ttk.Label(trade, text="价", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=6, padx=(14, 4))
-        ttk.Label(trade, textvariable=self.price_var, background=CARD_BG, foreground=UP_COLOR, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=7, padx=4)
-        ttk.Label(trade, text="现金", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=8, padx=(14, 4))
-        ttk.Label(trade, textvariable=self.cash_var, background=CARD_BG, foreground="#7ee787").grid(row=0, column=9, padx=4)
-        ttk.Label(trade, text="总资产", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=10, padx=(14, 4))
-        ttk.Label(trade, textvariable=self.equity_var, background=CARD_BG, foreground="#f0b429").grid(row=0, column=11, padx=4)
+        ttk.Button(trade, text="刷新", command=lambda: self._request_price_refresh(force=True)).grid(row=0, column=6, padx=4)
+        ttk.Button(trade, text="加入自选", command=self._add_current_to_watchlist).grid(row=0, column=7, padx=4)
+        ttk.Label(trade, text="价", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=8, padx=(14, 4))
+        ttk.Label(trade, textvariable=self.price_var, background=CARD_BG, foreground=UP_COLOR, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=9, padx=4)
+        ttk.Label(trade, text="现金", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=10, padx=(14, 4))
+        ttk.Label(trade, textvariable=self.cash_var, background=CARD_BG, foreground="#7ee787").grid(row=0, column=11, padx=4)
+        ttk.Label(trade, text="总资产", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=12, padx=(14, 4))
+        ttk.Label(trade, textvariable=self.equity_var, background=CARD_BG, foreground="#f0b429").grid(row=0, column=13, padx=4)
 
         order = ttk.Frame(self.content, style="Card.TFrame")
         order.pack(fill="x", pady=(0, 8))
@@ -430,8 +536,8 @@ class App(tk.Tk):
         self.shares_entry.insert(0, "1")
         ttk.Label(order, text="数量", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=0, padx=(12, 4), pady=8)
         self.shares_entry.grid(row=0, column=1)
-        ttk.Button(order, text="买入", command=self._buy).grid(row=0, column=2, padx=8)
-        ttk.Button(order, text="卖出", command=self._sell).grid(row=0, column=3, padx=8)
+        ttk.Button(order, text="买入/做多", command=self._buy).grid(row=0, column=2, padx=8)
+        ttk.Button(order, text="卖出/做空", command=self._sell).grid(row=0, column=3, padx=8)
         ttk.Button(order, text="保存组合", command=self._save_user_state).grid(row=0, column=4, padx=8)
         ttk.Button(order, text="导出交易CSV", command=self._export_history_csv).grid(row=0, column=5, padx=8)
         ttk.Button(order, text="会员AI训练", command=self._ask_ai_subscription).grid(row=0, column=6, padx=8)
@@ -573,10 +679,10 @@ class App(tk.Tk):
         middle.add(left, weight=3)
         middle.add(right, weight=2)
 
-        self.holding_view = ttk.Treeview(left, columns=("symbol", "shares", "avg", "last", "market", "pnl"), show="headings", height=12)
+        self.holding_view = ttk.Treeview(left, columns=("type", "symbol", "shares", "avg", "last", "market", "pnl"), show="headings", height=12)
         for col, title, width in [
-            ("symbol", "代码", 90), ("shares", "持仓", 90), ("avg", "成本价", 90),
-            ("last", "现价", 90), ("market", "市值", 100), ("pnl", "浮动盈亏", 100),
+            ("type", "类型", 70), ("symbol", "代码", 90), ("shares", "持仓/手", 90), ("avg", "成本价", 90),
+            ("last", "现价", 90), ("market", "市值/保证金", 110), ("pnl", "浮动盈亏", 100),
         ]:
             self.holding_view.heading(col, text=title)
             self.holding_view.column(col, width=width, anchor="center")
@@ -679,7 +785,20 @@ class App(tk.Tk):
         for row in self.user_data.get("history", []):
             self.history_list.insert("end", row)
 
+    def _on_asset_class_change(self, _event=None):
+        if self.asset_class.get() == "期货":
+            symbols = list(FUTURES_CONTRACTS.keys())
+            self.symbol_box.configure(values=symbols)
+            self.symbol.set(symbols[0])
+        else:
+            self._on_market_change()
+        self.price_var.set("--")
+        self._request_price_refresh(force=True)
+
     def _on_market_change(self, _event=None):
+        if self.asset_class.get() == "期货":
+            self._on_asset_class_change()
+            return
         symbols = MARKETS[self.market.get()]
         merged = sorted(set(symbols + self.user_data.get("watchlist", [])))
         self.symbol_box.configure(values=merged)
@@ -701,6 +820,7 @@ class App(tk.Tk):
                 symbols = {self.symbol.get().strip().upper()}
                 symbols.update(self.user_data.get("watchlist", [])[:30])
                 symbols.update(MARKET_INDICES.values())
+                symbols.update(FUTURES_CONTRACTS.keys())
                 for sym in sorted(s for s in symbols if s):
                     try:
                         data = yf.Ticker(sym).history(period="1d", interval="1m")
@@ -802,10 +922,16 @@ class App(tk.Tk):
             self.holding_view.delete(i)
         for pos in self.portfolio.positions.values():
             latest = self.price_cache.get(pos.symbol)
-            market_value = pos.shares * latest if latest else None
-            pnl = (latest - pos.avg_price) * pos.shares if latest else None
+            if pos.asset_type == "期货" and pos.symbol in FUTURES_CONTRACTS:
+                spec = FUTURES_CONTRACTS[pos.symbol]
+                margin = abs(pos.shares) * pos.avg_price * spec["multiplier"] * spec["margin_rate"]
+                pnl = None if latest is None else (latest - pos.avg_price) * pos.shares * spec["multiplier"]
+                market_value = margin
+            else:
+                market_value = pos.shares * latest if latest else None
+                pnl = (latest - pos.avg_price) * pos.shares if latest else None
             self.holding_view.insert("", "end", values=(
-                pos.symbol, f"{pos.shares:.2f}", f"{pos.avg_price:.2f}",
+                pos.asset_type, pos.symbol, f"{pos.shares:.2f}", f"{pos.avg_price:.2f}",
                 "--" if latest is None else f"{latest:.2f}",
                 "--" if market_value is None else f"{market_value:.2f}",
                 "--" if pnl is None else f"{pnl:+.2f}",
