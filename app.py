@@ -38,6 +38,25 @@ MARKETS = {
     "EU": ["ASML.AS", "SAP.DE", "MC.PA", "^STOXX50E"],
 }
 
+MARKET_INDICES = {
+    "上证指数": "000001.SS",
+    "深证成指": "399001.SZ",
+    "恒生指数": "^HSI",
+    "日经225": "^N225",
+    "标普500": "^GSPC",
+    "纳斯达克": "^IXIC",
+    "道琼斯": "^DJI",
+}
+
+APP_BG = "#0f1720"
+PANEL_BG = "#151f2b"
+CARD_BG = "#1b2836"
+TEXT_FG = "#d7e2ee"
+MUTED_FG = "#8ea0b5"
+UP_COLOR = "#e84b4b"
+DOWN_COLOR = "#21a67a"
+ACCENT = "#2f80ed"
+
 
 @dataclass
 class Position:
@@ -311,6 +330,7 @@ class App(tk.Tk):
 
         self.portfolio = Portfolio()
         self.price_cache: Dict[str, float] = {}
+        self.quote_cache: Dict[str, dict] = {}
         self.tick_queue: queue.Queue = queue.Queue()
         self._last_requested_symbol: Optional[str] = None
         self._last_equity_snapshot_at = 0.0
@@ -359,45 +379,71 @@ class App(tk.Tk):
         self.wait_window(dlg)
 
     def _build_ui(self):
-        top = ttk.Frame(self)
-        top.pack(fill="x", padx=12, pady=10)
-        ttk.Label(top, text=f"当前用户: {self.username}", foreground="purple").pack(side="left", padx=(0, 10))
-        ttk.Label(top, text="市场").pack(side="left")
-        market_box = ttk.Combobox(top, textvariable=self.market, values=list(MARKETS.keys()), width=8, state="readonly")
-        market_box.pack(side="left", padx=6)
+        self.configure(bg=APP_BG)
+        style = ttk.Style(self)
+        style.theme_use("clam")
+        style.configure("TFrame", background=APP_BG)
+        style.configure("Panel.TFrame", background=PANEL_BG)
+        style.configure("Card.TFrame", background=CARD_BG)
+        style.configure("TLabel", background=APP_BG, foreground=TEXT_FG)
+        style.configure("Muted.TLabel", background=APP_BG, foreground=MUTED_FG)
+        style.configure("TButton", padding=(10, 5))
+        style.configure("TNotebook", background=APP_BG, borderwidth=0)
+        style.configure("TNotebook.Tab", padding=(14, 7))
+        style.configure("Treeview", background="#101923", fieldbackground="#101923", foreground=TEXT_FG, rowheight=25, borderwidth=0)
+        style.configure("Treeview.Heading", background="#223246", foreground=TEXT_FG, relief="flat")
+        style.map("Treeview", background=[("selected", "#315a86")])
+
+        self._build_market_header()
+
+        main = ttk.Frame(self, style="TFrame")
+        main.pack(fill="both", expand=True, padx=10, pady=(0, 8))
+        self.sidebar = ttk.Frame(main, width=270, style="Panel.TFrame")
+        self.sidebar.pack(side="left", fill="y", padx=(0, 10))
+        self.sidebar.pack_propagate(False)
+        self.content = ttk.Frame(main, style="TFrame")
+        self.content.pack(side="left", fill="both", expand=True)
+        self._build_sidebar()
+
+        trade = ttk.Frame(self.content, style="Card.TFrame")
+        trade.pack(fill="x", pady=(0, 8))
+        ttk.Label(trade, text="市场", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=0, padx=(12, 4), pady=10)
+        market_box = ttk.Combobox(trade, textvariable=self.market, values=list(MARKETS.keys()), width=8, state="readonly")
+        market_box.grid(row=0, column=1, padx=4)
         market_box.bind("<<ComboboxSelected>>", self._on_market_change)
-        ttk.Label(top, text="代码").pack(side="left")
-        self.symbol_box = ttk.Combobox(top, textvariable=self.symbol, values=MARKETS[self.market.get()], width=14)
-        self.symbol_box.pack(side="left", padx=6)
+        ttk.Label(trade, text="代码", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=2, padx=(12, 4))
+        self.symbol_box = ttk.Combobox(trade, textvariable=self.symbol, values=MARKETS[self.market.get()], width=14)
+        self.symbol_box.grid(row=0, column=3, padx=4)
         self.symbol_box.bind("<<ComboboxSelected>>", lambda _event: self._request_price_refresh(force=True))
-        ttk.Button(top, text="刷新价格", command=lambda: self._request_price_refresh(force=True)).pack(side="left", padx=6)
-        ttk.Label(top, text="实时价:").pack(side="left", padx=(12, 4))
-        ttk.Label(top, textvariable=self.price_var, foreground="blue").pack(side="left")
-        ttk.Label(top, text="现金:").pack(side="left", padx=(16, 4))
-        ttk.Label(top, textvariable=self.cash_var, foreground="green").pack(side="left")
-        ttk.Label(top, text="总资产:").pack(side="left", padx=(16, 4))
-        ttk.Label(top, textvariable=self.equity_var, foreground="#b35").pack(side="left")
+        ttk.Button(trade, text="刷新", command=lambda: self._request_price_refresh(force=True)).grid(row=0, column=4, padx=4)
+        ttk.Button(trade, text="加入自选", command=self._add_current_to_watchlist).grid(row=0, column=5, padx=4)
+        ttk.Label(trade, text="价", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=6, padx=(14, 4))
+        ttk.Label(trade, textvariable=self.price_var, background=CARD_BG, foreground=UP_COLOR, font=("Microsoft YaHei UI", 12, "bold")).grid(row=0, column=7, padx=4)
+        ttk.Label(trade, text="现金", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=8, padx=(14, 4))
+        ttk.Label(trade, textvariable=self.cash_var, background=CARD_BG, foreground="#7ee787").grid(row=0, column=9, padx=4)
+        ttk.Label(trade, text="总资产", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=10, padx=(14, 4))
+        ttk.Label(trade, textvariable=self.equity_var, background=CARD_BG, foreground="#f0b429").grid(row=0, column=11, padx=4)
 
-        trade = ttk.LabelFrame(self, text="模拟交易")
-        trade.pack(fill="x", padx=12, pady=6)
-        self.shares_entry = ttk.Entry(trade, width=12)
+        order = ttk.Frame(self.content, style="Card.TFrame")
+        order.pack(fill="x", pady=(0, 8))
+        self.shares_entry = ttk.Entry(order, width=12)
         self.shares_entry.insert(0, "1")
-        ttk.Label(trade, text="数量").grid(row=0, column=0, padx=6, pady=8)
+        ttk.Label(order, text="数量", background=CARD_BG, foreground=MUTED_FG).grid(row=0, column=0, padx=(12, 4), pady=8)
         self.shares_entry.grid(row=0, column=1)
-        ttk.Button(trade, text="买入", command=self._buy).grid(row=0, column=2, padx=8)
-        ttk.Button(trade, text="卖出", command=self._sell).grid(row=0, column=3, padx=8)
-        ttk.Button(trade, text="保存组合", command=self._save_user_state).grid(row=0, column=4, padx=8)
-        ttk.Button(trade, text="导出交易CSV", command=self._export_history_csv).grid(row=0, column=5, padx=8)
-        ttk.Button(trade, text="会员AI训练", command=self._ask_ai_subscription).grid(row=0, column=6, padx=8)
+        ttk.Button(order, text="买入", command=self._buy).grid(row=0, column=2, padx=8)
+        ttk.Button(order, text="卖出", command=self._sell).grid(row=0, column=3, padx=8)
+        ttk.Button(order, text="保存组合", command=self._save_user_state).grid(row=0, column=4, padx=8)
+        ttk.Button(order, text="导出交易CSV", command=self._export_history_csv).grid(row=0, column=5, padx=8)
+        ttk.Button(order, text="会员AI训练", command=self._ask_ai_subscription).grid(row=0, column=6, padx=8)
 
-        self.tabs = ttk.Notebook(self)
-        self.tabs.pack(fill="both", expand=True, padx=12, pady=8)
+        self.tabs = ttk.Notebook(self.content)
+        self.tabs.pack(fill="both", expand=True)
         self.home_tab = ttk.Frame(self.tabs)
         self.trade_tab = ttk.Frame(self.tabs)
         self.watch_tab = ttk.Frame(self.tabs)
         self.chart_tab = ttk.Frame(self.tabs)
         self.backtest_tab = ttk.Frame(self.tabs)
-        self.tabs.add(self.home_tab, text="首页")
+        self.tabs.add(self.home_tab, text="行情首页")
         self.tabs.add(self.trade_tab, text="交易与持仓")
         self.tabs.add(self.watch_tab, text="股票搜索 / 自选股")
         self.tabs.add(self.chart_tab, text="收益曲线")
@@ -409,9 +455,55 @@ class App(tk.Tk):
         self._build_chart_tab()
         self._build_backtest_tab()
 
-        ttk.Separator(self).pack(fill="x", padx=12, pady=(0, 4))
-        ttk.Label(self, textvariable=self.status_var, foreground="#075").pack(anchor="w", padx=12, pady=(0, 8))
+        status = ttk.Frame(self, style="TFrame")
+        status.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Label(status, textvariable=self.status_var, foreground=MUTED_FG, background=APP_BG).pack(anchor="w")
 
+    def _build_market_header(self):
+        header = tk.Frame(self, bg="#07111d", height=74)
+        header.pack(fill="x")
+        header.pack_propagate(False)
+        left = tk.Frame(header, bg="#07111d")
+        left.pack(side="left", fill="y", padx=14)
+        tk.Label(left, text="StockTrainer Pro", bg="#07111d", fg="#ffffff", font=("Microsoft YaHei UI", 16, "bold")).pack(anchor="w", pady=(9, 0))
+        tk.Label(left, text=f"用户 {self.username} · 实时行情训练终端", bg="#07111d", fg=MUTED_FG).pack(anchor="w")
+        self.market_strip = tk.Frame(header, bg="#07111d")
+        self.market_strip.pack(side="left", fill="both", expand=True, padx=10)
+        self.index_labels: Dict[str, Tuple[tk.Label, tk.Label]] = {}
+        for name, symbol in MARKET_INDICES.items():
+            box = tk.Frame(self.market_strip, bg="#0d1b2a", padx=10, pady=7)
+            box.pack(side="left", padx=5, pady=9)
+            title = tk.Label(box, text=name, bg="#0d1b2a", fg=MUTED_FG, font=("Microsoft YaHei UI", 9))
+            title.pack(anchor="w")
+            val = tk.Label(box, text="--", bg="#0d1b2a", fg=TEXT_FG, font=("Consolas", 11, "bold"))
+            val.pack(anchor="w")
+            self.index_labels[symbol] = (title, val)
+
+    def _build_sidebar(self):
+        tk.Label(self.sidebar, text="大盘指数", bg=PANEL_BG, fg=TEXT_FG, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=10, pady=(12, 4))
+        self.index_view = ttk.Treeview(self.sidebar, columns=("name", "price", "chg"), show="headings", height=8)
+        for col, title, width in [("name", "指数", 82), ("price", "最新", 78), ("chg", "涨跌", 72)]:
+            self.index_view.heading(col, text=title)
+            self.index_view.column(col, width=width, anchor="center")
+        self.index_view.pack(fill="x", padx=8, pady=(0, 10))
+        self.index_view.tag_configure("up", foreground=UP_COLOR)
+        self.index_view.tag_configure("down", foreground=DOWN_COLOR)
+
+        tk.Label(self.sidebar, text="自选股票", bg=PANEL_BG, fg=TEXT_FG, font=("Microsoft YaHei UI", 11, "bold")).pack(anchor="w", padx=10, pady=(8, 4))
+        quick = tk.Frame(self.sidebar, bg=PANEL_BG)
+        quick.pack(fill="x", padx=8, pady=(0, 6))
+        self.sidebar_add_entry = ttk.Entry(quick, width=14)
+        self.sidebar_add_entry.pack(side="left", fill="x", expand=True)
+        ttk.Button(quick, text="添加", command=self._add_sidebar_symbol).pack(side="left", padx=(5, 0))
+        self.sidebar_watch_view = ttk.Treeview(self.sidebar, columns=("symbol", "price", "chg"), show="headings", height=19)
+        for col, title, width in [("symbol", "代码", 82), ("price", "最新", 78), ("chg", "涨跌", 72)]:
+            self.sidebar_watch_view.heading(col, text=title)
+            self.sidebar_watch_view.column(col, width=width, anchor="center")
+        self.sidebar_watch_view.pack(fill="both", expand=True, padx=8, pady=(0, 8))
+        self.sidebar_watch_view.tag_configure("up", foreground=UP_COLOR)
+        self.sidebar_watch_view.tag_configure("down", foreground=DOWN_COLOR)
+        self.sidebar_watch_view.bind("<Double-1>", lambda _event: self._use_sidebar_watchlist())
+        ttk.Button(self.sidebar, text="刷新自选", command=self._refresh_watchlist_prices).pack(fill="x", padx=8, pady=(0, 10))
 
     def _load_strategy_params(self):
         params = self.user_data.get("strategy_params", {}) if self.user_data else {}
@@ -578,6 +670,7 @@ class App(tk.Tk):
     def _refresh_all_views(self):
         self._refresh_portfolio_view()
         self._refresh_watchlist_view()
+        self._refresh_market_views()
         self._draw_equity_curve()
         self._refresh_home_summary()
 
@@ -606,14 +699,19 @@ class App(tk.Tk):
         def run():
             while True:
                 symbols = {self.symbol.get().strip().upper()}
-                symbols.update(self.user_data.get("watchlist", [])[:8])
+                symbols.update(self.user_data.get("watchlist", [])[:30])
+                symbols.update(MARKET_INDICES.values())
                 for sym in sorted(s for s in symbols if s):
                     try:
                         data = yf.Ticker(sym).history(period="1d", interval="1m")
                         if not data.empty:
-                            price = float(data["Close"].iloc[-1])
-                            if math.isfinite(price) and price > 0:
-                                self.tick_queue.put(("price", sym, price))
+                            closes = [float(x) for x in data["Close"].tolist() if math.isfinite(float(x))]
+                            if closes:
+                                price = closes[-1]
+                                base = closes[-2] if len(closes) > 1 else closes[0]
+                                change = price - base
+                                pct = (change / base * 100) if base else 0.0
+                                self.tick_queue.put(("quote", sym, {"price": price, "change": change, "pct": pct}))
                         elif sym == self.symbol.get().strip().upper():
                             self.tick_queue.put(("status", sym, "未获取到行情数据"))
                     except Exception as exc:
@@ -627,14 +725,30 @@ class App(tk.Tk):
         try:
             while True:
                 kind, sym, payload = self.tick_queue.get_nowait()
-                if kind == "price":
-                    price = float(payload)
+                if kind == "quote":
+                    quote = dict(payload)
+                    price = float(quote.get("price", 0))
                     self.price_cache[sym] = price
+                    self.quote_cache[sym] = quote
                     if sym == self.symbol.get().strip().upper():
                         self.price_var.set(f"{price:.2f}")
                         self.status_var.set(f"{sym} 行情已更新")
                     self._refresh_portfolio_view(refresh_history=False)
                     self._refresh_watchlist_view()
+                    self._refresh_market_views()
+                elif kind == "price":
+                    price = float(payload)
+                    old = self.price_cache.get(sym, price)
+                    change = price - old
+                    pct = (change / old * 100) if old else 0.0
+                    self.price_cache[sym] = price
+                    self.quote_cache[sym] = {"price": price, "change": change, "pct": pct}
+                    if sym == self.symbol.get().strip().upper():
+                        self.price_var.set(f"{price:.2f}")
+                        self.status_var.set(f"{sym} 行情已更新")
+                    self._refresh_portfolio_view(refresh_history=False)
+                    self._refresh_watchlist_view()
+                    self._refresh_market_views()
                 elif kind == "status" and sym == self.symbol.get().strip().upper():
                     self.status_var.set(str(payload))
         except queue.Empty:
@@ -757,6 +871,16 @@ class App(tk.Tk):
 
     def _add_watchlist_from_search(self):
         symbol = self.search_var.get().strip().upper()
+        self._add_symbol_to_watchlist(symbol)
+
+    def _add_current_to_watchlist(self):
+        self._add_symbol_to_watchlist(self.symbol.get().strip().upper())
+
+    def _add_sidebar_symbol(self):
+        self._add_symbol_to_watchlist(self.sidebar_add_entry.get().strip().upper())
+        self.sidebar_add_entry.delete(0, "end")
+
+    def _add_symbol_to_watchlist(self, symbol: str):
         if not symbol:
             return
         watch = self.user_data.setdefault("watchlist", [])
@@ -767,6 +891,28 @@ class App(tk.Tk):
             self._refresh_watchlist_view()
             self._extend_symbol_box(symbol)
             self.status_var.set(f"已加入自选: {symbol}")
+        self._request_price_refresh(force=True)
+
+    def _format_quote(self, symbol: str):
+        quote = self.quote_cache.get(symbol, {})
+        price = quote.get("price", self.price_cache.get(symbol))
+        change = quote.get("change")
+        pct = quote.get("pct")
+        price_text = "--" if price is None else f"{float(price):.2f}"
+        chg_text = "--" if change is None or pct is None else f"{float(change):+.2f} {float(pct):+.2f}%"
+        tag = "up" if (change or 0) >= 0 else "down"
+        return price_text, chg_text, tag
+
+    def _refresh_market_views(self):
+        if hasattr(self, "index_view"):
+            for i in self.index_view.get_children():
+                self.index_view.delete(i)
+            for name, symbol in MARKET_INDICES.items():
+                price_text, chg_text, tag = self._format_quote(symbol)
+                self.index_view.insert("", "end", values=(name, price_text, chg_text), tags=(tag,))
+                if hasattr(self, "index_labels") and symbol in self.index_labels:
+                    _, val = self.index_labels[symbol]
+                    val.configure(text=f"{price_text}  {chg_text}", fg=UP_COLOR if tag == "up" else DOWN_COLOR)
 
     def _selected_watch_symbol(self) -> Optional[str]:
         sel = self.watch_view.selection()
@@ -810,15 +956,32 @@ class App(tk.Tk):
                     continue
         threading.Thread(target=worker, daemon=True).start()
 
-    def _refresh_watchlist_view(self):
-        if not hasattr(self, "watch_view"):
+    def _use_sidebar_watchlist(self):
+        sel = self.sidebar_watch_view.selection() if hasattr(self, "sidebar_watch_view") else []
+        if not sel:
             return
-        for i in self.watch_view.get_children():
-            self.watch_view.delete(i)
-        for sym in self.user_data.get("watchlist", []):
-            price = self.price_cache.get(sym)
-            held = "持仓" if sym in self.portfolio.positions else ""
-            self.watch_view.insert("", "end", values=(sym, "--" if price is None else f"{price:.2f}", held))
+        symbol = str(self.sidebar_watch_view.item(sel[0], "values")[0])
+        self.search_var.set(symbol)
+        self.symbol.set(symbol)
+        self._extend_symbol_box(symbol)
+        self._request_price_refresh(force=True)
+        self.tabs.select(self.trade_tab)
+
+    def _refresh_watchlist_view(self):
+        watch = self.user_data.get("watchlist", [])
+        if hasattr(self, "watch_view"):
+            for i in self.watch_view.get_children():
+                self.watch_view.delete(i)
+            for sym in watch:
+                price_text, chg_text, tag = self._format_quote(sym)
+                held = "持仓" if sym in self.portfolio.positions else chg_text
+                self.watch_view.insert("", "end", values=(sym, price_text, held), tags=(tag,))
+        if hasattr(self, "sidebar_watch_view"):
+            for i in self.sidebar_watch_view.get_children():
+                self.sidebar_watch_view.delete(i)
+            for sym in watch:
+                price_text, chg_text, tag = self._format_quote(sym)
+                self.sidebar_watch_view.insert("", "end", values=(sym, price_text, chg_text), tags=(tag,))
 
 
     def _draw_kline_from_search(self):
