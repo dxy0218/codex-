@@ -19,6 +19,7 @@ import tkinter as tk
 from tkinter import filedialog, messagebox, ttk
 
 import urllib.parse
+import urllib.request
 import webbrowser
 
 import yfinance as yf
@@ -29,13 +30,17 @@ DB_FILE = APP_DIR / "stock_trainer.sqlite3"
 MAX_TOTAL_EXPOSURE = 1_000_000.0
 MAX_SINGLE_TRADE = 200_000.0
 INITIAL_CASH = 100_000.0
-PRICE_REFRESH_SECONDS = 5
+PRICE_REFRESH_SECONDS = 3
+DASHBOARD_REFRESH_SECONDS = 45
+NEWS_REFRESH_SECONDS = 180
+FX_FEE_RATE = 0.002
 
 MARKETS = {
     "US": ["AAPL", "MSFT", "NVDA", "SPY"],
     "CN/HK": ["0700.HK", "9988.HK", "000001.SS", "399001.SZ"],
     "JP": ["7203.T", "6758.T", "9984.T", "^N225"],
     "EU": ["ASML.AS", "SAP.DE", "MC.PA", "^STOXX50E"],
+    "CRYPTO": ["BTC-USD", "ETH-USD", "SOL-USD", "BNB-USD"],
 }
 
 MARKET_INDICES = {
@@ -46,6 +51,8 @@ MARKET_INDICES = {
     "标普500": "^GSPC",
     "纳斯达克": "^IXIC",
     "道琼斯": "^DJI",
+    "比特币": "BTC-USD",
+    "以太坊": "ETH-USD",
 }
 
 APP_BG = "#0f1720"
@@ -65,20 +72,24 @@ FUTURES_CONTRACTS = {
     "CL=F": {"name": "NYMEX原油", "exchange": "NYMEX", "multiplier": 1000, "margin_rate": 0.12, "currency": "USD"},
 }
 
+FX_PAIRS = {"CNY": "CNY=X", "HKD": "HKD=X", "JPY": "JPY=X", "EUR": "EURUSD=X", "USD": "USD"}
+
 
 def market_rule_for(symbol: str) -> dict:
     symbol = symbol.upper()
     if symbol in FUTURES_CONTRACTS:
-        return {"asset_type": "期货", "market": FUTURES_CONTRACTS[symbol]["exchange"], "lot_size": 1, "short_allowed": True, "t_plus_one": False}
+        return {"asset_type": "期货", "market": FUTURES_CONTRACTS[symbol]["exchange"], "lot_size": 1, "short_allowed": True, "t_plus_one": False, "currency": "USD"}
+    if symbol.endswith("-USD"):
+        return {"asset_type": "加密货币", "market": "Crypto", "lot_size": 0.000001, "short_allowed": False, "t_plus_one": False, "currency": "USD"}
     if symbol.endswith((".SS", ".SZ")):
-        return {"asset_type": "股票", "market": "A股", "lot_size": 100, "short_allowed": False, "t_plus_one": True}
+        return {"asset_type": "股票", "market": "A股", "lot_size": 100, "short_allowed": False, "t_plus_one": True, "currency": "CNY"}
     if symbol.endswith(".HK"):
-        return {"asset_type": "股票", "market": "港股", "lot_size": 100, "short_allowed": False, "t_plus_one": False}
+        return {"asset_type": "股票", "market": "港股", "lot_size": 100, "short_allowed": False, "t_plus_one": False, "currency": "HKD"}
     if symbol.endswith(".T"):
-        return {"asset_type": "股票", "market": "日股", "lot_size": 100, "short_allowed": False, "t_plus_one": False}
+        return {"asset_type": "股票", "market": "日股", "lot_size": 100, "short_allowed": False, "t_plus_one": False, "currency": "JPY"}
     if "." in symbol and not symbol.startswith("^"):
-        return {"asset_type": "股票", "market": "国际", "lot_size": 1, "short_allowed": False, "t_plus_one": False}
-    return {"asset_type": "股票", "market": "美股", "lot_size": 1, "short_allowed": False, "t_plus_one": False}
+        return {"asset_type": "股票", "market": "国际", "lot_size": 1, "short_allowed": True, "t_plus_one": False, "currency": "USD"}
+    return {"asset_type": "股票", "market": "美股", "lot_size": 1, "short_allowed": True, "t_plus_one": False, "currency": "USD"}
 
 
 @dataclass
@@ -92,9 +103,45 @@ class Position:
 
 
 class Portfolio:
-    def __init__(self, cash: float = INITIAL_CASH):
-        self.cash = cash
+    def __init__(self, cash: float = INITIAL_CASH, balances: Optional[Dict[str, float]] = None):
+        self.balances = {"USD": 50_000.0, "CNY": 350_000.0, "HKD": 0.0, "JPY": 0.0, "EUR": 0.0}
+        if balances:
+            for k, v in balances.items():
+                self.balances[k] = float(v)
+        else:
+            self.balances["USD"] = float(cash)
         self.positions: Dict[str, Position] = {}
+
+    @property
+    def cash(self) -> float:
+        return self.balances.get("USD", 0.0)
+
+    @cash.setter
+    def cash(self, value: float):
+        self.balances["USD"] = float(value)
+
+    def available(self, currency: str) -> float:
+        return self.balances.get(currency, 0.0)
+
+    def debit(self, currency: str, amount: float):
+        if self.available(currency) < amount:
+            raise ValueError(f"{currency} 账户余额不足，需要 {amount:.2f}")
+        self.balances[currency] = self.available(currency) - amount
+
+    def credit(self, currency: str, amount: float):
+        self.balances[currency] = self.available(currency) + amount
+
+    def convert_currency(self, from_ccy: str, to_ccy: str, amount: float, fx_rates: Dict[str, float]) -> float:
+        self._validate_positive_number("兑换金额", amount)
+        if from_ccy == to_ccy:
+            return amount
+        self.debit(from_ccy, amount)
+        usd_value = amount if from_ccy == "USD" else amount / fx_rates.get(from_ccy, 1.0)
+        target = usd_value if to_ccy == "USD" else usd_value * fx_rates.get(to_ccy, 1.0)
+        fee = target * FX_FEE_RATE
+        received = target - fee
+        self.credit(to_ccy, received)
+        return received
 
     def exposure(self) -> float:
         total = 0.0
@@ -106,7 +153,7 @@ class Portfolio:
         return total
 
     def market_value(self, price_cache: Dict[str, float]) -> float:
-        total = self.cash
+        total = sum(self.balances.values())
         for pos in self.positions.values():
             latest = price_cache.get(pos.symbol, pos.avg_price)
             if pos.asset_type == "期货" and pos.symbol in FUTURES_CONTRACTS:
@@ -124,8 +171,8 @@ class Portfolio:
     def _validate_lot(symbol: str, shares: float, action: str):
         rule = market_rule_for(symbol)
         lot = rule["lot_size"]
-        if rule["asset_type"] == "股票" and action == "buy" and lot > 1 and not math.isclose(shares % lot, 0, abs_tol=1e-9):
-            raise ValueError(f"{rule['market']}买入需按 {lot} 股/手整数倍下单")
+        if rule["asset_type"] == "股票" and action == "buy" and lot >= 1 and not math.isclose(shares % lot, 0, abs_tol=1e-9):
+            raise ValueError(f"{rule['market']}买入需按 {lot:g} 股/手整数倍下单")
         if rule["asset_type"] == "期货" and not float(shares).is_integer():
             raise ValueError("期货按合约整数手交易")
 
@@ -138,22 +185,27 @@ class Portfolio:
         if rule["asset_type"] == "期货":
             self.open_future(symbol, shares, price, side="long")
             return
+        ccy = rule.get("currency", "USD")
         cost = shares * price
-        if cost > self.cash:
-            raise ValueError("现金不足")
-        if cost > MAX_SINGLE_TRADE:
-            raise ValueError(f"单笔交易上限为 {MAX_SINGLE_TRADE:.0f}")
-        if self.exposure() + cost > MAX_TOTAL_EXPOSURE:
-            raise ValueError(f"总投资上限为 {MAX_TOTAL_EXPOSURE:.0f}")
+        self.debit(ccy, cost)
         pos = self.positions.get(symbol)
-        if pos:
+        if pos and pos.shares >= 0:
             total_cost = pos.shares * pos.avg_price + cost
             total_shares = pos.shares + shares
             pos.avg_price = total_cost / total_shares
             pos.shares = total_shares
+        elif pos and pos.shares < 0:
+            cover = min(shares, abs(pos.shares))
+            pnl = (pos.avg_price - price) * cover
+            self.credit(ccy, pnl)
+            pos.shares += cover
+            if math.isclose(pos.shares, 0, abs_tol=1e-9):
+                del self.positions[symbol]
+            extra = shares - cover
+            if extra > 0:
+                self.buy(symbol, extra, price)
         else:
             self.positions[symbol] = Position(symbol, shares, price, rule["asset_type"], rule["market"], datetime.now().date().isoformat())
-        self.cash -= cost
 
     def sell(self, symbol: str, shares: float, price: float):
         symbol = symbol.upper()
@@ -168,23 +220,39 @@ class Portfolio:
             else:
                 self.open_future(symbol, shares, price, side="short")
             return
-        if not pos or pos.shares < shares:
-            raise ValueError("持仓不足；股票模拟暂不允许裸卖空")
-        if rule.get("t_plus_one") and pos.opened_at == datetime.now().date().isoformat():
-            raise ValueError("A股执行 T+1：当日买入的股票不能当日卖出")
-        pos.shares -= shares
-        self.cash += shares * price
-        if math.isclose(pos.shares, 0, abs_tol=1e-9):
-            del self.positions[symbol]
+        ccy = rule.get("currency", "USD")
+        if pos and pos.shares > 0:
+            if rule.get("t_plus_one") and pos.opened_at == datetime.now().date().isoformat():
+                raise ValueError("A股执行 T+1：当日买入的股票不能当日卖出")
+            close_qty = min(shares, pos.shares)
+            pos.shares -= close_qty
+            self.credit(ccy, close_qty * price)
+            if math.isclose(pos.shares, 0, abs_tol=1e-9):
+                del self.positions[symbol]
+            remain = shares - close_qty
+            if remain > 0:
+                self.sell(symbol, remain, price)
+            return
+        if not rule.get("short_allowed"):
+            raise ValueError("该市场暂不允许裸卖空")
+        margin = shares * price * 0.5
+        self.debit(ccy, margin)
+        if pos and pos.shares < 0:
+            total = abs(pos.shares) + shares
+            pos.avg_price = (abs(pos.shares) * pos.avg_price + shares * price) / total
+            pos.shares -= shares
+        else:
+            self.positions[symbol] = Position(symbol, -shares, price, rule["asset_type"], rule["market"], datetime.now().date().isoformat())
+        self.credit(ccy, shares * price)
 
     def open_future(self, symbol: str, contracts: float, price: float, side: str):
         spec = FUTURES_CONTRACTS.get(symbol)
         if not spec:
             raise ValueError("未配置该期货合约参数")
+        ccy = spec.get("currency", "USD")
         signed = contracts if side == "long" else -contracts
         margin = abs(contracts) * price * spec["multiplier"] * spec["margin_rate"]
-        if margin > self.cash:
-            raise ValueError(f"保证金不足，需要约 {margin:.2f}")
+        self.debit(ccy, margin)
         pos = self.positions.get(symbol)
         if pos and pos.shares * signed < 0:
             raise ValueError("已有反向期货持仓，请先平仓")
@@ -195,7 +263,6 @@ class Portfolio:
         else:
             rule = market_rule_for(symbol)
             self.positions[symbol] = Position(symbol, signed, price, "期货", rule["market"], datetime.now().date().isoformat())
-        self.cash -= margin
 
     def close_future(self, symbol: str, contracts: float, price: float):
         pos = self.positions.get(symbol)
@@ -204,20 +271,21 @@ class Portfolio:
             raise ValueError("没有可平期货持仓")
         if contracts > abs(pos.shares):
             raise ValueError("平仓手数超过持仓")
+        ccy = spec.get("currency", "USD")
         direction = 1 if pos.shares > 0 else -1
         pnl = (price - pos.avg_price) * contracts * spec["multiplier"] * direction
         released_margin = contracts * pos.avg_price * spec["multiplier"] * spec["margin_rate"]
-        self.cash += released_margin + pnl
+        self.credit(ccy, released_margin + pnl)
         pos.shares -= contracts * direction
         if math.isclose(pos.shares, 0, abs_tol=1e-9):
             del self.positions[symbol]
 
     def to_json(self):
-        return {"cash": self.cash, "positions": [asdict(p) for p in self.positions.values()]}
+        return {"cash": self.cash, "balances": self.balances, "positions": [asdict(p) for p in self.positions.values()]}
 
     @staticmethod
     def from_json(raw):
-        pf = Portfolio(cash=float(raw.get("cash", INITIAL_CASH)))
+        pf = Portfolio(cash=float(raw.get("cash", INITIAL_CASH)), balances=raw.get("balances"))
         for item in raw.get("positions", []):
             symbol = str(item["symbol"]).upper()
             rule = market_rule_for(symbol)
@@ -431,6 +499,10 @@ class App(tk.Tk):
         self.backtest_slow_var = tk.IntVar(value=60)
         self.dashboard_symbol_var = tk.StringVar(value="000001.SS")
         self.dashboard_period_var = tk.StringVar(value="6mo")
+        self.fx_rates = {"USD": 1.0, "CNY": 7.2, "HKD": 7.8, "JPY": 155.0, "EUR": 0.92}
+        self.fx_from_var = tk.StringVar(value="USD")
+        self.fx_to_var = tk.StringVar(value="CNY")
+        self.fx_amount_var = tk.StringVar(value="1000")
 
         self.portfolio = Portfolio()
         self.price_cache: Dict[str, float] = {}
@@ -543,6 +615,11 @@ class App(tk.Tk):
         ttk.Button(order, text="保存组合", command=self._save_user_state).grid(row=0, column=4, padx=8)
         ttk.Button(order, text="导出交易CSV", command=self._export_history_csv).grid(row=0, column=5, padx=8)
         ttk.Button(order, text="会员AI训练", command=self._ask_ai_subscription).grid(row=0, column=6, padx=8)
+        ttk.Label(order, text="兑换", background=CARD_BG, foreground=MUTED_FG).grid(row=1, column=0, padx=(12,4), pady=8)
+        ttk.Combobox(order, textvariable=self.fx_from_var, values=list(self.fx_rates.keys()), width=6, state="readonly").grid(row=1, column=1)
+        ttk.Combobox(order, textvariable=self.fx_to_var, values=list(self.fx_rates.keys()), width=6, state="readonly").grid(row=1, column=2)
+        ttk.Entry(order, textvariable=self.fx_amount_var, width=10).grid(row=1, column=3)
+        ttk.Button(order, text="实时汇率兑换", command=self._convert_currency).grid(row=1, column=4, padx=8)
 
         self.tabs = ttk.Notebook(self.content)
         self.tabs.pack(fill="both", expand=True)
@@ -647,7 +724,7 @@ class App(tk.Tk):
 
         controls = ttk.Frame(left, style="Card.TFrame")
         controls.pack(fill="x", pady=(0, 8))
-        universe = {**MARKET_INDICES, **{v["name"]: k for k, v in FUTURES_CONTRACTS.items()}}
+        universe = {**MARKET_INDICES, **{v["name"]: k for k, v in FUTURES_CONTRACTS.items()}, "比特币BTC": "BTC-USD", "以太坊ETH": "ETH-USD", "Solana": "SOL-USD", "BNB": "BNB-USD"}
         self.dashboard_symbol_map = universe
         ttk.Label(controls, text="市场/合约", background=CARD_BG, foreground=MUTED_FG).pack(side="left", padx=(10, 4), pady=8)
         self.dashboard_box = ttk.Combobox(controls, textvariable=self.dashboard_symbol_var, values=list(universe.values()), width=16)
@@ -686,9 +763,11 @@ class App(tk.Tk):
             self.after(0, lambda: self.status_var.set(f"{symbol} K线已更新"))
         except Exception as exc:
             self.after(0, lambda: self.status_var.set(f"K线刷新失败: {exc}"))
+        finally:
+            self.after(DASHBOARD_REFRESH_SECONDS * 1000, self._refresh_dashboard_chart)
 
     def _refresh_market_news(self):
-        symbols = [self.dashboard_symbol_var.get().strip().upper() or "000001.SS", "^GSPC", "^IXIC", "ES=F", "GC=F"]
+        symbols = [self.dashboard_symbol_var.get().strip().upper() or "000001.SS", "^GSPC", "^IXIC", "ES=F", "GC=F", "BTC-USD", "ETH-USD"]
         self.status_var.set("正在刷新金融资讯...")
         threading.Thread(target=self._market_news_worker, args=(symbols,), daemon=True).start()
 
@@ -702,7 +781,7 @@ class App(tk.Tk):
                     link = item.get("link") or item.get("content", {}).get("canonicalUrl", {}).get("url")
                     if title and title not in seen:
                         seen.add(title)
-                        items.append((sym, title, link or ""))
+                        items.append((sym, self._translate_to_zh(title), link or ""))
             except Exception:
                 continue
         if not items:
@@ -718,6 +797,21 @@ class App(tk.Tk):
             self.news_list.insert("end", f"[{sym}] {title}")
             self.news_links.append(link)
         self.status_var.set("金融资讯已更新")
+        self.after(NEWS_REFRESH_SECONDS * 1000, self._refresh_market_news)
+
+    def _translate_to_zh(self, text: str) -> str:
+        if not text:
+            return text
+        if any("\u4e00" <= ch <= "\u9fff" for ch in text):
+            return text
+        try:
+            url = "https://translate.googleapis.com/translate_a/single?client=gtx&sl=auto&tl=zh-CN&dt=t&q=" + urllib.parse.quote(text)
+            with urllib.request.urlopen(url, timeout=4) as resp:
+                data = json.loads(resp.read().decode("utf-8"))
+            translated = "".join(part[0] for part in data[0] if part and part[0])
+            return translated or text
+        except Exception:
+            return text
 
     def _open_selected_news(self):
         if not hasattr(self, "news_list"):
@@ -895,6 +989,7 @@ class App(tk.Tk):
                 symbols.update(self.user_data.get("watchlist", [])[:30])
                 symbols.update(MARKET_INDICES.values())
                 symbols.update(FUTURES_CONTRACTS.keys())
+                symbols.update([v for v in FX_PAIRS.values() if v != "USD"])
                 for sym in sorted(s for s in symbols if s):
                     try:
                         data = yf.Ticker(sym).history(period="1d", interval="1m")
@@ -924,6 +1019,7 @@ class App(tk.Tk):
                     price = float(quote.get("price", 0))
                     self.price_cache[sym] = price
                     self.quote_cache[sym] = quote
+                    self._update_fx_from_quote(sym, price)
                     if sym == self.symbol.get().strip().upper():
                         self.price_var.set(f"{price:.2f}")
                         self.status_var.set(f"{sym} 行情已更新")
@@ -948,6 +1044,27 @@ class App(tk.Tk):
         except queue.Empty:
             pass
         self.after(300, self._consume_ticks)
+
+    def _update_fx_from_quote(self, symbol: str, price: float):
+        if symbol == "CNY=X":
+            self.fx_rates["CNY"] = price
+        elif symbol == "HKD=X":
+            self.fx_rates["HKD"] = price
+        elif symbol == "JPY=X":
+            self.fx_rates["JPY"] = price
+        elif symbol == "EURUSD=X" and price:
+            self.fx_rates["EUR"] = 1 / price
+
+    def _convert_currency(self):
+        try:
+            amount = float(self.fx_amount_var.get().strip())
+            received = self.portfolio.convert_currency(self.fx_from_var.get(), self.fx_to_var.get(), amount, self.fx_rates)
+            self._save_user_state(silent=True)
+            self._refresh_portfolio_view()
+            self._record_history(f"货币兑换 {amount:.2f} {self.fx_from_var.get()} -> {received:.2f} {self.fx_to_var.get()}，手续费率 {FX_FEE_RATE*100:.2f}%")
+            messagebox.showinfo("兑换完成", f"到账 {received:.2f} {self.fx_to_var.get()}（已扣手续费）")
+        except Exception as exc:
+            messagebox.showwarning("兑换失败", str(exc))
 
     def _current_price(self, symbol: str) -> float:
         p = self.price_cache.get(symbol.upper())
@@ -989,7 +1106,7 @@ class App(tk.Tk):
             messagebox.showwarning("交易限制", str(e))
 
     def _refresh_portfolio_view(self, refresh_history=True):
-        self.cash_var.set(f"{self.portfolio.cash:.2f}")
+        self.cash_var.set(" | ".join([f"{k}:{v:.0f}" for k, v in self.portfolio.balances.items() if abs(v) > 0.01]))
         equity = self.portfolio.market_value(self.price_cache)
         self.equity_var.set(f"{equity:.2f}")
         for i in self.holding_view.get_children():
